@@ -20,3 +20,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Original reverse-engineering/reference inputs kept locally only
+/app-service.deobfuscated.js
+/bracelet_app_interaction_repro.md
+/手环协议.md
+/需求文档.txt
