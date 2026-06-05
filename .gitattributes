@@ -1,0 +1,20 @@
+* text=auto
+
+*.kt text
+*.kts text
+*.xml text
+*.md text
+*.txt text
+*.properties text
+*.gradle text
+*.bat text eol=crlf
+*.sh text eol=lf
+gradlew text eol=lf
+
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.apk binary
