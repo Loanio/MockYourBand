@@ -26,3 +26,6 @@ Thumbs.db
 /bracelet_app_interaction_repro.md
 /手环协议.md
 /需求文档.txt
+
+# Local release artifacts
+/dist/
