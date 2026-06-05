@@ -6,6 +6,20 @@ MockYourBand is an Android BLE wristband simulator and debugging tool. It turns 
 
 This project is useful for debugging, reverse-engineering reproduction, protocol validation, and app integration testing.
 
+## What This Project Is For
+
+Many wearable apps are hard to test because they depend on a real wristband being nearby, charged, paired, and behaving correctly. MockYourBand gives you a controllable "virtual wristband" that runs on an Android phone.
+
+With it, you can:
+
+- Show how a wristband app behaves without carrying the original device.
+- Reproduce connection and data-sync problems in a predictable way.
+- Demonstrate heart rate, battery, sleep, and device-status scenarios on demand.
+- Help product, QA, support, and research teams understand the app flow without needing BLE protocol knowledge.
+- Create safer demos because the data is simulated and can be changed at any time.
+
+Think of it as a rehearsal device for apps that normally need a physical smart band.
+
 ## Features
 
 - Simulates a BLE wristband as an Android BLE Peripheral.
@@ -104,3 +118,4 @@ The original reverse-engineering reference files in the repository root are igno
 ## Disclaimer
 
 This project is intended only for learning, debugging, protocol reproduction, and compatibility testing. Do not use it for unauthorized device access, data spoofing, or bypassing security mechanisms.
+
