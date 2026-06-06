@@ -22,6 +22,8 @@
 
 下载测试版 App：<https://github.com/Loanio/MockYourBand/releases>
 
+有什么问题或建议请提交issue
+
 ## 技术特性
 
 - 手机模拟 BLE Peripheral 手环设备。
