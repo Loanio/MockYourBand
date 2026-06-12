@@ -17,8 +17,11 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Paint
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,6 +46,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -73,14 +77,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.mockbracelet.ui.theme.MockBraceletTheme
@@ -103,6 +111,10 @@ private val WRITE_CHARACTERISTIC_UUID: UUID = UUID.fromString("6E400002-B5A3-F39
 private val NOTIFY_CHARACTERISTIC_UUID: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 private val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
 private const val MAX_STEPS = 16_777_215
+private const val HEART_HISTORY_WINDOW_MS = 10 * 60 * 1000L
+private const val MAX_HEART_HISTORY_POINTS = 240
+private const val ADVANCE_ADVERTISING_DELAY_MS = 800L
+private const val ADAPTER_NAME_APPLY_DELAY_MS = 500L
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -145,7 +157,7 @@ private fun BraceletDebuggerApp(modifier: Modifier = Modifier) {
     val scope = rememberCoroutineScope()
     val peripheral = remember { BleBraceletPeripheral(context.applicationContext, logger) }
     var state by remember { mutableStateOf(peripheral.snapshot()) }
-    val heartHistory = remember { mutableStateListOf<Int>() }
+    val heartHistory = remember { mutableStateListOf<HeartSample>() }
     val requiredPermissions = remember { blePermissions() }
     var hasPermissions by remember { mutableStateOf(requiredPermissions.allGranted(context)) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
@@ -165,8 +177,8 @@ private fun BraceletDebuggerApp(modifier: Modifier = Modifier) {
     fun updateHeartRate(value: Int, source: String) {
         val bpm = value.coerceIn(30, 220)
         persist(settings.copy(heartRate = bpm.toString()))
-        heartHistory.add(bpm)
-        if (heartHistory.size > 60) heartHistory.removeRange(0, heartHistory.size - 60)
+        heartHistory.add(HeartSample(System.currentTimeMillis(), bpm))
+        trimHeartHistory(heartHistory)
         logger("$source heartRate=$bpm")
     }
 
@@ -181,15 +193,24 @@ private fun BraceletDebuggerApp(modifier: Modifier = Modifier) {
 
     LaunchedEffect(Unit) {
         peripheral.onStateChanged = { state = it }
-        heartHistory.add(settings.heartRate.decimalIn(76, 30, 220))
+        heartHistory.add(HeartSample(System.currentTimeMillis(), settings.heartRate.decimalIn(76, 30, 220)))
         if (!hasPermissions) {
             permissionLauncher.launch(requiredPermissions)
         }
     }
-    LaunchedEffect(state.isRunning, settings.autoHeartEnabled, settings.heartMin, settings.heartMax, settings.heartMode) {
+    LaunchedEffect(
+        state.isRunning,
+        settings.autoHeartEnabled,
+        settings.heartMin,
+        settings.heartMax,
+        settings.heartMode,
+        settings.heartUpdateSeconds,
+        settings.heartJitter,
+        settings.heartCurvePeriodSeconds
+    ) {
         while (state.isRunning && settings.autoHeartEnabled) {
             updateHeartRate(simulatedHeartRate(settings), "自动心率")
-            delay(2_500L)
+            delay(settings.heartUpdateSeconds.decimalIn(3, 1, 60) * 1000L)
         }
     }
     LaunchedEffect(state.isRunning, settings.autoStepsEnabled, settings.stepMinSeconds, settings.stepMaxSeconds) {
@@ -310,7 +331,7 @@ private fun AppDrawer(current: AppPage, state: PeripheralState, settings: AppSet
                 Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("BLE Band", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold, color = Color.White)
                     Text(settings.deviceName, color = Color(0xFFCFE9DE), fontFamily = FontFamily.Monospace)
-                    Text(if (state.isRunning) "广播中 · ${state.advertisers} 个实例" else "未启动广播", color = Color(0xFFFFD98A), fontWeight = FontWeight.SemiBold)
+                    Text(if (state.isRunning) "广播中 · ${state.advertisers} 个入口" else "未启动广播", color = Color(0xFFFFD98A), fontWeight = FontWeight.SemiBold)
                 }
             }
             Text("功能模块", color = Color(0xFF5D6F68), fontWeight = FontWeight.Bold)
@@ -365,7 +386,7 @@ private fun ControlPage(
     onChange: (AppSettings) -> Unit,
     repository: List<BraceletConfig>,
     selectedNames: Set<String>,
-    heartHistory: List<Int>,
+    heartHistory: List<HeartSample>,
     state: PeripheralState,
     onSelectionChange: (Set<String>) -> Unit,
     onGoRepository: () -> Unit,
@@ -374,6 +395,7 @@ private fun ControlPage(
     modifier: Modifier = Modifier
 ) {
     val effective = effectiveRepositorySelection(repository, selectedNames, settings)
+    val advertiseHz = settings.advertiseIntervalMs.toHz()
     LazyColumn(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             SectionCard("当前模拟") {
@@ -381,14 +403,21 @@ private fun ControlPage(
                     val item = effective.first()
                     Text(item.name, color = Color(0xFF173B33), fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
                     Text("${item.deviceName} · HR ${item.heartRate} · BAT ${item.battery}% · STEP ${item.steps}", color = Color(0xFF48645D))
-                    Text("广播 ${"%.2f".format(1000f / item.advertiseIntervalMs)} Hz / ${item.advertiseIntervalMs} ms", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                 } else {
                     Text("已选择 ${effective.size} 个手环参与模拟", color = Color(0xFF173B33), fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
+                    Text("扫描阶段显示当前待连接手环；每连上一台设备后自动切到下一个手环。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                     effective.take(4).forEach { item ->
                         Text("${item.name} · ${item.deviceName} · HR ${item.heartRate}", color = Color(0xFF48645D), style = MaterialTheme.typography.bodySmall)
                     }
                     if (effective.size > 4) Text("还有 ${effective.size - 4} 个...", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                 }
+                Text("广播频率：${"%.2f".format(advertiseHz)} Hz（${settings.advertiseIntervalMs} ms）", color = Color(0xFF173B33), fontWeight = FontWeight.Bold)
+                Slider(
+                    value = advertiseHz,
+                    onValueChange = { onChange(settings.copy(advertiseIntervalMs = it.toAdvertiseIntervalMs())) },
+                    valueRange = 0.2f..10f,
+                    steps = 97
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onGoRepository) { Text("去仓库修改") }
                     Button(onClick = onStart, enabled = !state.isRunning) { Text("开始广播") }
@@ -402,9 +431,19 @@ private fun ControlPage(
                 if (settings.autoHeartEnabled) {
                     Text("广播启动后才会开始生成心率；未广播时不会运行随机/曲线计算。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        DecimalField("最小 bpm", settings.heartMin, { onChange(settings.copy(heartMin = it)) }, 30, 220, Modifier.weight(1f))
-                        DecimalField("最大 bpm", settings.heartMax, { onChange(settings.copy(heartMax = it)) }, 30, 220, Modifier.weight(1f))
+                        DeferredDecimalField("最小 bpm", settings.heartMin, { onChange(settings.copy(heartMin = it)) }, 30, 220, Modifier.weight(1f))
+                        DeferredDecimalField("最大 bpm", settings.heartMax, { onChange(settings.copy(heartMax = it)) }, 30, 220, Modifier.weight(1f))
                         ModePicker(settings.heartMode, { onChange(settings.copy(heartMode = it)) }, Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        DecimalField("更新间隔 秒", settings.heartUpdateSeconds, { onChange(settings.copy(heartUpdateSeconds = it)) }, 1, 60, Modifier.weight(1f))
+                        DecimalField("抖动 bpm", settings.heartJitter, { onChange(settings.copy(heartJitter = it)) }, 0, 30, Modifier.weight(1f))
+                    }
+                    if (settings.heartMode == HeartMode.TimeCurve) {
+                        DecimalField("曲线周期 秒", settings.heartCurvePeriodSeconds, { onChange(settings.copy(heartCurvePeriodSeconds = it)) }, 10, 600, Modifier.fillMaxWidth())
+                        Text("曲线周期越长，心率变化越平缓；抖动用于模拟真实手环读数的小幅波动。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text("随机模式会在最小/最大心率之间取值，抖动越大，连续读数变化越明显。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                     }
                     ToggleRow("显示实时趋势图", settings.showHeartChart, { onChange(settings.copy(showHeartChart = it)) })
                     if (settings.showHeartChart) HeartRateChart(heartHistory)
@@ -413,7 +452,7 @@ private fun ControlPage(
         }
         item {
             SectionCard("模拟步数增加") {
-                ToggleRow("开启后随机间隔步数 +1，超过协议上限自动归零", settings.autoStepsEnabled, { onChange(settings.copy(autoStepsEnabled = it)) })
+                ToggleRow("开启后随机间隔步数 +1，超过上限自动归零", settings.autoStepsEnabled, { onChange(settings.copy(autoStepsEnabled = it)) })
                 if (settings.autoStepsEnabled) {
                     Text("广播启动后才会按随机间隔递增步数；停止广播后自动暂停。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -471,13 +510,11 @@ private fun RepositoryPage(
     var heartRate by remember { mutableStateOf("76") }
     var battery by remember { mutableStateOf("87") }
     var steps by remember { mutableStateOf("0") }
-    var intervalMs by remember { mutableStateOf("1000") }
     val formValid = name.isNotBlank() &&
         deviceName.isNotBlank() &&
         heartRate.toIntOrNull()?.let { it in 30..220 } == true &&
         battery.toIntOrNull()?.let { it in 0..100 } == true &&
-        steps.toIntOrNull()?.let { it in 0..MAX_STEPS } == true &&
-        intervalMs.toIntOrNull()?.let { it in 100..5000 } == true
+        steps.toIntOrNull()?.let { it in 0..MAX_STEPS } == true
 
     fun fillForm(item: BraceletConfig) {
         editingName = item.name
@@ -486,7 +523,6 @@ private fun RepositoryPage(
         heartRate = item.heartRate
         battery = item.battery
         steps = item.steps
-        intervalMs = item.advertiseIntervalMs.toString()
     }
 
     fun clearForm() {
@@ -496,7 +532,6 @@ private fun RepositoryPage(
         heartRate = "76"
         battery = "87"
         steps = "0"
-        intervalMs = "1000"
     }
 
     fun formItem(): BraceletConfig = BraceletConfig(
@@ -505,7 +540,7 @@ private fun RepositoryPage(
         heartRate = heartRate,
         battery = battery,
         steps = steps,
-        advertiseIntervalMs = intervalMs.decimalIn(1000, 100, 5000),
+        advertiseIntervalMs = settings.advertiseIntervalMs,
         replyTemplate = ReplyTemplate.Auto,
         autoChecksum = true,
         corruptChecksum = false,
@@ -519,15 +554,14 @@ private fun RepositoryPage(
     Column(modifier = modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SectionCard("手环仓库") {
             Text("填写参数后点击 + 添加到仓库。长按列表项可修改或删除。", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
-            OutlinedTextField(name, { name = it }, label = { Text("配置名称，不能为空") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(deviceName, { deviceName = it.take(18) }, label = { Text("广播设备名，不能为空") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(name, { name = it }, label = { Text("配置名称，随便填写，只是给这一项配置起个名字，和实际发送数据无关") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(deviceName, { deviceName = it.take(18) }, label = { Text("广播设备名，不能为空，尽量和真实手环的名称一致，比如M6_XXXX") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 DecimalField("心率 30-220", heartRate, { heartRate = it }, 30, 220, Modifier.weight(1f))
                 DecimalField("电量 0-100", battery, { battery = it }, 0, 100, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                DecimalField("步数 0-$MAX_STEPS", steps, { steps = it }, 0, MAX_STEPS, Modifier.weight(1f))
-                DecimalField("间隔 ms 100-5000", intervalMs, { intervalMs = it }, 100, 5000, Modifier.weight(1f))
+                DecimalField("步数 0-$MAX_STEPS", steps, { steps = it }, 0, MAX_STEPS, Modifier.fillMaxWidth())
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
@@ -603,7 +637,6 @@ private fun RepositoryListItem(
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text("${index + 1}. ${item.name}", color = Color(0xFF173B33), fontWeight = FontWeight.Bold)
                     Text("${item.deviceName} · HR ${item.heartRate} · BAT ${item.battery}% · STEP ${item.steps}", color = Color(0xFF48645D), style = MaterialTheme.typography.bodySmall)
-                    Text("${"%.2f".format(1000f / item.advertiseIntervalMs)} Hz / ${item.advertiseIntervalMs} ms", color = Color(0xFF63746E), style = MaterialTheme.typography.bodySmall)
                 }
                 Button(onClick = onSelectClick, enabled = canJoin, shape = RoundedCornerShape(14.dp)) {
                     Text(
@@ -671,6 +704,35 @@ private fun DecimalField(label: String, value: String, onValueChange: (String) -
 }
 
 @Composable
+private fun DeferredDecimalField(label: String, value: String, onCommit: (String) -> Unit, min: Int, max: Int, modifier: Modifier = Modifier) {
+    var draft by remember(value) { mutableStateOf(value) }
+    var focused by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+    val parsed = draft.toIntOrNull()
+    val valid = parsed != null && parsed in min..max
+
+    fun commit() {
+        val next = parsed?.coerceIn(min, max)?.toString() ?: value
+        draft = next
+        onCommit(next)
+    }
+
+    OutlinedTextField(
+        value = draft,
+        onValueChange = { raw -> draft = raw.filter { it.isDigit() } },
+        label = { Text(label) },
+        supportingText = { if (!valid) Text("范围 $min-$max") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+        modifier = modifier.onFocusChanged { state ->
+            if (focused && !state.isFocused) commit()
+            focused = state.isFocused
+        }
+    )
+}
+
+@Composable
 private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
         Text(label, modifier = Modifier.weight(1f), color = Color(0xFF304B47))
@@ -717,29 +779,70 @@ private fun DropButton(selected: String, options: List<String>, onSelected: (Str
 }
 
 @Composable
-private fun HeartRateChart(values: List<Int>) {
+private fun HeartRateChart(values: List<HeartSample>) {
     Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF102A25)), shape = RoundedCornerShape(18.dp)) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("心率趋势（最近 ${values.size} 点）", color = Color.White, fontWeight = FontWeight.Bold)
-            Canvas(modifier = Modifier.fillMaxWidth().height(150.dp)) {
-                val points = values.ifEmpty { listOf(60, 80) }
-                val min = (points.minOrNull() ?: 40).coerceAtMost(40)
-                val max = (points.maxOrNull() ?: 180).coerceAtLeast(180)
-                val span = (max - min).coerceAtLeast(1)
+            val spanMs = ((values.lastOrNull()?.timestampMs ?: 0L) - (values.firstOrNull()?.timestampMs ?: 0L)).coerceAtLeast(0L)
+            val timeUnit = if (spanMs >= 90_000L) "min" else "s"
+            Text("心率趋势（bpm / $timeUnit，最近 ${values.size} 点）", color = Color.White, fontWeight = FontWeight.Bold)
+            Canvas(modifier = Modifier.fillMaxWidth().height(190.dp)) {
+                val now = System.currentTimeMillis()
+                val points = values.ifEmpty { listOf(HeartSample(now, 60), HeartSample(now + 1000L, 80)) }
+                val minValue = points.minOf { it.bpm }
+                val maxValue = points.maxOf { it.bpm }
+                val min = ((minValue - 5).coerceAtLeast(30) / 10) * 10
+                val max = (((maxValue + 14).coerceAtMost(220)) / 10) * 10
+                val span = (max - min).coerceAtLeast(10)
+                val startMs = points.first().timestampMs
+                val endMs = points.last().timestampMs.coerceAtLeast(startMs + 1000L)
+                val timeSpanMs = (endMs - startMs).coerceAtLeast(1000L)
+                val left = 44f
+                val right = size.width - 8f
+                val top = 12f
+                val bottom = size.height - 32f
+                val chartWidth = (right - left).coerceAtLeast(1f)
+                val chartHeight = (bottom - top).coerceAtLeast(1f)
+                val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.rgb(217, 255, 244)
+                    textSize = 24f
+                }
+                val mutedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = android.graphics.Color.rgb(141, 181, 169)
+                    textSize = 22f
+                    textAlign = Paint.Align.CENTER
+                }
                 val path = Path()
                 points.forEachIndexed { index, value ->
-                    val x = if (points.size == 1) 0f else size.width * index / (points.size - 1)
-                    val y = size.height - ((value - min).toFloat() / span) * size.height
+                    val x = left + ((value.timestampMs - startMs).toFloat() / timeSpanMs) * chartWidth
+                    val y = bottom - ((value.bpm - min).toFloat() / span) * chartHeight
                     if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
                 repeat(4) { i ->
-                    val y = size.height * i / 3f
-                    drawLine(Color(0x335FE4B1), Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
+                    val ratio = i / 3f
+                    val y = bottom - ratio * chartHeight
+                    val bpm = (min + span * ratio).roundToInt()
+                    drawLine(Color(0x335FE4B1), Offset(left, y), Offset(right, y), strokeWidth = 1f)
+                    drawContext.canvas.nativeCanvas.drawText("$bpm", 4f, y + 8f, labelPaint)
                 }
+                repeat(4) { i ->
+                    val ratio = i / 3f
+                    val x = left + ratio * chartWidth
+                    val seconds = timeSpanMs / 1000f * ratio
+                    val label = if (timeSpanMs >= 90_000L) "%.1f".format(seconds / 60f) else seconds.roundToInt().toString()
+                    drawLine(Color(0x225FE4B1), Offset(x, top), Offset(x, bottom), strokeWidth = 1f)
+                    drawContext.canvas.nativeCanvas.drawText(label, x, size.height - 6f, mutedPaint)
+                }
+                drawLine(Color(0x885FE4B1), Offset(left, bottom), Offset(right, bottom), strokeWidth = 2f)
+                drawLine(Color(0x885FE4B1), Offset(left, top), Offset(left, bottom), strokeWidth = 2f)
                 drawPath(path, Color(0xFF5FE4B1), style = Stroke(width = 5f))
                 points.lastOrNull()?.let { last ->
-                    drawCircle(Color(0xFFFFC857), radius = 8f, center = Offset(size.width, size.height - ((last - min).toFloat() / span) * size.height))
+                    val x = left + ((last.timestampMs - startMs).toFloat() / timeSpanMs) * chartWidth
+                    val y = bottom - ((last.bpm - min).toFloat() / span) * chartHeight
+                    drawCircle(Color(0xFFFFC857), radius = 8f, center = Offset(x, y))
+                    drawContext.canvas.nativeCanvas.drawText("${last.bpm} bpm", (x - 44f).coerceIn(left, right - 72f), (y - 12f).coerceAtLeast(top + 20f), labelPaint)
                 }
+                drawContext.canvas.nativeCanvas.drawText("时间 ($timeUnit)", (left + right) / 2f, size.height - 6f, mutedPaint)
+                drawContext.canvas.nativeCanvas.drawText("bpm", 6f, top + 4f, labelPaint)
             }
         }
     }
@@ -763,6 +866,7 @@ private enum class AppPage(val label: String, val description: String) {
     Logs("日志", "查看 BLE 调试事件")
 }
 private enum class HeartMode(val label: String) { Random("随机"), TimeCurve("时间曲线") }
+private data class HeartSample(val timestampMs: Long, val bpm: Int)
 private enum class ReplyTemplate(val label: String) {
     Auto("自动协议回包"),
     ManualDecimal("手动十进制帧"),
@@ -787,6 +891,9 @@ private data class AppSettings(
     val heartMin: String = "62",
     val heartMax: String = "96",
     val heartMode: HeartMode = HeartMode.TimeCurve,
+    val heartUpdateSeconds: String = "3",
+    val heartJitter: String = "2",
+    val heartCurvePeriodSeconds: String = "36",
     val showHeartChart: Boolean = true,
     val autoStepsEnabled: Boolean = false,
     val stepMinSeconds: String = "2",
@@ -804,6 +911,9 @@ private data class AppSettings(
     fun sanitized(): AppSettings {
         val minHr = heartMin.decimalIn(62, 30, 220)
         val maxHr = heartMax.decimalIn(96, minHr, 220)
+        val updateSeconds = heartUpdateSeconds.decimalIn(3, 1, 60)
+        val jitter = heartJitter.decimalIn(2, 0, 30)
+        val curvePeriod = heartCurvePeriodSeconds.decimalIn(36, 10, 600)
         val minStep = stepMinSeconds.decimalIn(2, 1, 3600)
         val maxStep = stepMaxSeconds.decimalIn(8, minStep, 3600)
         return copy(
@@ -814,6 +924,9 @@ private data class AppSettings(
             advertiseIntervalMs = advertiseIntervalMs.coerceIn(100, 5000),
             heartMin = minHr.toString(),
             heartMax = maxHr.toString(),
+            heartUpdateSeconds = updateSeconds.toString(),
+            heartJitter = jitter.toString(),
+            heartCurvePeriodSeconds = curvePeriod.toString(),
             stepMinSeconds = minStep.toString(),
             stepMaxSeconds = maxStep.toString(),
             batchCount = if (batchEnabled) batchCount.decimalIn(1, 1, 8).toString() else "1"
@@ -858,7 +971,6 @@ private data class BraceletConfig(
         heartRate = heartRate,
         battery = battery,
         steps = steps,
-        advertiseIntervalMs = advertiseIntervalMs,
         replyTemplate = replyTemplate,
         autoChecksum = autoChecksum,
         corruptChecksum = corruptChecksum,
@@ -881,6 +993,8 @@ private data class DeviceParameters(
     val hexFrameInput: String = "",
     val overrideAutoReplies: Boolean = false
 )
+
+private data class VirtualBracelet(val name: String, val params: DeviceParameters)
 
 private data class PeripheralState(
     val isRunning: Boolean = false,
@@ -924,6 +1038,9 @@ private fun JSONObject.toSettings(): AppSettings = AppSettings(
     heartMin = optString("heartMin", "62"),
     heartMax = optString("heartMax", "96"),
     heartMode = enumValue(optString("heartMode", HeartMode.TimeCurve.name), HeartMode.TimeCurve),
+    heartUpdateSeconds = optString("heartUpdateSeconds", "3"),
+    heartJitter = optString("heartJitter", "2"),
+    heartCurvePeriodSeconds = optString("heartCurvePeriodSeconds", "36"),
     showHeartChart = optBoolean("showHeartChart", true),
     autoStepsEnabled = optBoolean("autoStepsEnabled", false),
     stepMinSeconds = optString("stepMinSeconds", "2"),
@@ -949,6 +1066,9 @@ private fun AppSettings.toJson(): JSONObject = JSONObject()
     .put("heartMin", heartMin)
     .put("heartMax", heartMax)
     .put("heartMode", heartMode.name)
+    .put("heartUpdateSeconds", heartUpdateSeconds)
+    .put("heartJitter", heartJitter)
+    .put("heartCurvePeriodSeconds", heartCurvePeriodSeconds)
     .put("showHeartChart", showHeartChart)
     .put("autoStepsEnabled", autoStepsEnabled)
     .put("stepMinSeconds", stepMinSeconds)
@@ -984,7 +1104,6 @@ private fun BraceletConfig.toJson(): JSONObject = JSONObject()
     .put("heartRate", heartRate)
     .put("battery", battery)
     .put("steps", steps)
-    .put("advertiseIntervalMs", advertiseIntervalMs)
     .put("replyTemplate", replyTemplate.name)
     .put("autoChecksum", autoChecksum)
     .put("corruptChecksum", corruptChecksum)
@@ -1002,7 +1121,14 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
     private var gattServer: BluetoothGattServer? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private val subscribedDevices = mutableSetOf<BluetoothDevice>()
+    private val virtualBracelets = mutableListOf<VirtualBracelet>()
+    private val deviceAssignments = mutableMapOf<String, Int>()
+    private val availableQueue = ArrayDeque<Int>()
     private val callbacks = mutableListOf<AdvertiseCallback>()
+    private val queueHandler = Handler(Looper.getMainLooper())
+    private var advertisingIndex = 0
+    private var advanceRunnable: Runnable? = null
+    private var pendingAdvertiseRunnable: Runnable? = null
     private var params = DeviceParameters("Bracelet-001", 76, 87, 0, 1000)
     private var state = PeripheralState()
         set(value) {
@@ -1019,11 +1145,23 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
         if (!localAdapter.isEnabled) return log("蓝牙未开启")
         if (localAdapter.bluetoothLeAdvertiser == null) return log("设备不支持 BLE Peripheral 广播")
         stop()
-        localAdapter.name = params.deviceName.take(18)
         openGattServer()
-        val batchParams = batch.ifEmpty { listOf(params.toConfig("当前手环")) }.map { it.toSettings(AppSettings()).toParameters() }
-        batchParams.forEachIndexed { index, item -> startAdvertising(localAdapter, item, index) }
+        val pool = batch.ifEmpty { listOf(params.toConfig("当前手环")) }.map { item ->
+            VirtualBracelet(
+                name = item.name,
+                params = item.toSettings(AppSettings())
+                    .copy(advertiseIntervalMs = params.advertiseIntervalMs)
+                    .toParameters()
+            )
+        }
+        virtualBracelets.clear()
+        virtualBracelets.addAll(pool)
+        availableQueue.clear()
+        availableQueue.addAll(virtualBracelets.indices)
+        advertisingIndex = availableQueue.firstOrNull() ?: 0
+        advertiseCurrentVirtualBracelet(localAdapter)
         state = state.copy(isRunning = callbacks.isNotEmpty(), advertisers = callbacks.size)
+        log("虚拟手环池已就绪：${virtualBracelets.joinToString { it.name }}；扫描阶段显示当前待连接手环，连接后推进到下一个")
     }
 
     fun updateParameters(newParams: DeviceParameters) {
@@ -1033,21 +1171,55 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
 
     fun sendTemplateReplies(newParams: DeviceParameters) {
         params = newParams
-        val replies = ProtocolFrames.preview(params)
-        if (replies.isEmpty()) return log("当前模板没有可发送帧")
         if (subscribedDevices.isEmpty()) return log("没有已连接设备，无法发送模板回包")
-        subscribedDevices.forEach { device -> replies.forEach { notify(device, it) } }
+        subscribedDevices.forEach { device ->
+            val replies = ProtocolFrames.preview(paramsFor(device))
+            if (replies.isEmpty()) log("${device.address} 当前模板没有可发送帧") else replies.forEach { notify(device, it) }
+        }
     }
 
     @SuppressLint("MissingPermission")
     fun stop() {
-        callbacks.forEach { adapter?.bluetoothLeAdvertiser?.stopAdvertising(it) }
-        callbacks.clear()
+        cancelPendingAdvance()
+        stopAdvertisingOnly()
         gattServer?.close()
         gattServer = null
         notifyCharacteristic = null
         subscribedDevices.clear()
+        virtualBracelets.clear()
+        deviceAssignments.clear()
+        availableQueue.clear()
         state = state.copy(isRunning = false, connectedDevices = 0, advertisers = 0)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun advertiseCurrentVirtualBracelet(adapter: BluetoothAdapter) {
+        val current = virtualBracelets.getOrNull(advertisingIndex) ?: VirtualBracelet("当前手环", params)
+        stopAdvertisingOnly()
+        pendingAdvertiseRunnable?.let { queueHandler.removeCallbacks(it) }
+        adapter.name = current.params.deviceName.take(18)
+        pendingAdvertiseRunnable = Runnable {
+            startAdvertising(adapter, current.params, advertisingIndex)
+            state = state.copy(isRunning = callbacks.isNotEmpty(), advertisers = callbacks.size)
+            log("等待连接 -> ${current.name} (${adapter.name}, HR ${current.params.heartRate}, BAT ${current.params.battery}%, STEP ${current.params.steps})")
+            pendingAdvertiseRunnable = null
+        }.also {
+            queueHandler.postDelayed(it, ADAPTER_NAME_APPLY_DELAY_MS)
+            log("切换广播名 -> ${current.params.deviceName.take(18)}，${ADAPTER_NAME_APPLY_DELAY_MS}ms 后开始广播")
+        }
+    }
+
+    private fun cancelPendingAdvance() {
+        advanceRunnable?.let { queueHandler.removeCallbacks(it) }
+        advanceRunnable = null
+        pendingAdvertiseRunnable?.let { queueHandler.removeCallbacks(it) }
+        pendingAdvertiseRunnable = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopAdvertisingOnly() {
+        callbacks.forEach { adapter?.bluetoothLeAdvertiser?.stopAdvertising(it) }
+        callbacks.clear()
     }
 
     @SuppressLint("MissingPermission")
@@ -1090,9 +1262,12 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
             ((item.steps ushr 16) and 0xFF).toByte()
         )
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(index == 0)
+            .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(SCAN_SERVICE_UUID))
             .addServiceData(ParcelUuid(SCAN_SERVICE_UUID), payload)
+            .build()
+        val scanResponse = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
             .build()
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
@@ -1104,31 +1279,36 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
             }
         }
         callbacks.add(callback)
-        adapter.bluetoothLeAdvertiser.startAdvertising(settings, data, callback)
+        adapter.bluetoothLeAdvertiser.startAdvertising(settings, data, scanResponse, callback)
     }
 
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 subscribedDevices.add(device)
-                log("设备连接：${device.address}")
+                val assigned = assignBraceletForConnection(device)
+                log("设备连接：${device.address} -> ${assigned.name} (${assigned.params.deviceName}, HR ${assigned.params.heartRate}, BAT ${assigned.params.battery}%, STEP ${assigned.params.steps})")
+                advertiseNextAvailable()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 subscribedDevices.remove(device)
-                log("设备断开：${device.address}")
+                releaseAssignment(device)
+                advertiseNextAvailable()
             }
             state = state.copy(connectedDevices = subscribedDevices.size)
         }
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
-            val value = ProtocolFrames.heartRate(params.heartRate)
+            val assigned = assignedBracelet(device)
+            val value = ProtocolFrames.heartRate(assigned.params.heartRate)
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             state = state.copy(lastTx = value.toHex())
-            log("READ -> ${value.toHex()}")
+            log("READ ${device.address}(${assigned.name}) -> ${value.toHex()}")
         }
 
         override fun onDescriptorWriteRequest(device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
             if (descriptor.uuid == CLIENT_CONFIG_DESCRIPTOR_UUID) {
                 subscribedDevices.add(device)
+                assignBraceletForConnection(device)
                 state = state.copy(connectedDevices = subscribedDevices.size)
                 log("NOTIFY 订阅写入：${device.address} value=${value.toHex()}")
             }
@@ -1138,11 +1318,63 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
         override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
             val rx = value.toHex()
             state = state.copy(lastRx = rx)
-            log("WRITE <- $rx")
+            val assigned = assignedBracelet(device)
+            log("WRITE ${device.address}(${assigned.name}) <- $rx")
             if (responseNeeded) gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-            ProtocolFrames.replyTo(value, params).forEach { notify(device, it) }
+            ProtocolFrames.replyTo(value, assigned.params).forEach { notify(device, it) }
         }
     }
+
+    private fun assignedBracelet(device: BluetoothDevice): VirtualBracelet {
+        val pool = virtualBracelets.ifEmpty { listOf(VirtualBracelet("当前手环", params)) }
+        val index = deviceAssignments[device.address] ?: advertisingIndex.coerceIn(0, pool.lastIndex)
+        return pool[index % pool.size]
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun assignBraceletForConnection(device: BluetoothDevice): VirtualBracelet {
+        val pool = virtualBracelets.ifEmpty { listOf(VirtualBracelet("当前手环", params)) }
+        val existing = deviceAssignments[device.address]
+        if (existing != null) return pool[existing % pool.size]
+        val assignedIndex = if (availableQueue.isNotEmpty()) availableQueue.removeFirst() else advertisingIndex.coerceIn(0, pool.lastIndex)
+        deviceAssignments[device.address] = assignedIndex
+        return pool[assignedIndex % pool.size]
+    }
+
+    private fun releaseAssignment(device: BluetoothDevice) {
+        val releasedIndex = deviceAssignments.remove(device.address)
+        if (releasedIndex == null) {
+            log("设备断开：${device.address}，无绑定手环")
+            return
+        }
+        if (releasedIndex !in availableQueue) availableQueue.addLast(releasedIndex)
+        val released = virtualBracelets.getOrNull(releasedIndex)
+        log("设备断开：${device.address}，${released?.name ?: "手环$releasedIndex"} 已回到队尾")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun advertiseNextAvailable() {
+        val pool = virtualBracelets
+        if (pool.isEmpty()) return
+        val nextIndex = availableQueue.firstOrNull() ?: run {
+            stopAdvertisingOnly()
+            state = state.copy(isRunning = subscribedDevices.isNotEmpty(), advertisers = callbacks.size)
+            log("当前无空闲虚拟手环，停止等待广播，保持现有连接分别响应")
+            return
+        }
+        val localAdapter = adapter ?: return
+        cancelPendingAdvance()
+        advanceRunnable = Runnable {
+            advertisingIndex = nextIndex
+            advertiseCurrentVirtualBracelet(localAdapter)
+            advanceRunnable = null
+        }.also {
+            queueHandler.postDelayed(it, ADVANCE_ADVERTISING_DELAY_MS)
+            log("${ADVANCE_ADVERTISING_DELAY_MS}ms 后切换等待 ${pool[nextIndex].name}")
+        }
+    }
+
+    private fun paramsFor(device: BluetoothDevice): DeviceParameters = assignedBracelet(device).params
 
     @SuppressLint("MissingPermission")
     private fun notify(device: BluetoothDevice, value: ByteArray) {
@@ -1150,7 +1382,7 @@ private class BleBraceletPeripheral(private val context: Context, private val lo
         characteristic.value = value
         gattServer?.notifyCharacteristicChanged(device, characteristic, false)
         state = state.copy(lastTx = value.toHex())
-        log("NOTIFY -> ${value.toHex()}")
+        log("NOTIFY ${device.address}(${assignedBracelet(device).name}) -> ${value.toHex()}")
     }
 }
 
@@ -1283,7 +1515,8 @@ private fun runtimeParameters(
         ?: settings
     return base.copy(
         heartRate = if (settings.autoHeartEnabled) settings.heartRate else base.heartRate,
-        steps = if (settings.autoStepsEnabled) settings.steps else base.steps
+        steps = if (settings.autoStepsEnabled) settings.steps else base.steps,
+        advertiseIntervalMs = settings.advertiseIntervalMs
     ).toParameters()
 }
 
@@ -1298,11 +1531,27 @@ private fun uniqueRepositoryName(name: String, repository: List<BraceletConfig>)
 private fun simulatedHeartRate(settings: AppSettings): Int {
     val min = settings.heartMin.decimalIn(62, 30, 220)
     val max = settings.heartMax.decimalIn(96, min, 220)
-    if (settings.heartMode == HeartMode.Random) return Random.nextInt(min, max + 1)
-    val phase = (System.currentTimeMillis() / 1000.0) / 18.0 * 2.0 * PI
+    val jitter = settings.heartJitter.decimalIn(2, 0, 30)
+    if (settings.heartMode == HeartMode.Random) {
+        val current = settings.heartRate.decimalIn((min + max) / 2, min, max)
+        val low = (current - jitter.coerceAtLeast(1)).coerceAtLeast(min)
+        val high = (current + jitter.coerceAtLeast(1)).coerceAtMost(max)
+        return Random.nextInt(low, high + 1)
+    }
+    val period = settings.heartCurvePeriodSeconds.decimalIn(36, 10, 600).toDouble()
+    val phase = (System.currentTimeMillis() / 1000.0) / period * 2.0 * PI
     val base = min + (max - min) / 2.0
     val wave = sin(phase) * (max - min) / 2.8
-    return (base + wave + Random.nextInt(-2, 3)).roundToInt().coerceIn(min, max)
+    val noise = if (jitter == 0) 0 else Random.nextInt(-jitter, jitter + 1)
+    return (base + wave + noise).roundToInt().coerceIn(min, max)
+}
+
+private fun trimHeartHistory(history: MutableList<HeartSample>) {
+    val cutoff = System.currentTimeMillis() - HEART_HISTORY_WINDOW_MS
+    while (history.size > 1 && history.first().timestampMs < cutoff) history.removeAt(0)
+    if (history.size > MAX_HEART_HISTORY_POINTS) {
+        history.subList(0, history.size - MAX_HEART_HISTORY_POINTS).clear()
+    }
 }
 
 private fun ByteArray.toHex(): String = joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
