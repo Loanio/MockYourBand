@@ -29,6 +29,12 @@
 
 有什么问题或建议请提交issue
 
+## 注意事项
+
+这个项目即将废止，因为我们又开启了一个革命性的项目，可以从根源上解决一切问题：
+
+https://github.com/Loanio/SportsRefactored
+
 ## 技术特性
 
 - 手机模拟 BLE Peripheral 手环设备。
